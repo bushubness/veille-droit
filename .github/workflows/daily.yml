@@ -1,0 +1,251 @@
+name: Veille droit quotidienne
+
+on:
+  schedule:
+    # 05:30 UTC = 7h30 (ete) / 6h30 (hiver) heure de Paris
+    - cron: "30 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  envoi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Installer les dependances
+        run: pip install feedparser anthropic requests
+      - name: Ecrire le script
+        run: |
+          cat > newsletter.py <<'PY'
+          #!/usr/bin/env python3
+          # -*- coding: utf-8 -*-
+          """
+          Veille droit français — pipeline 100% autonome.
+          1. Récupère les nouveautés (flux RSS officiels service-public.fr)
+          2. Sélectionne + vulgarise les plus importantes via l'API Claude
+          3. Envoie une campagne email via Brevo à toute la liste d'abonnés
+
+          Aucune intervention humaine. Lancé chaque matin par GitHub Actions.
+          """
+
+          import os
+          import sys
+          import json
+          import datetime as dt
+
+          import requests
+          import feedparser
+          import anthropic
+
+          # ---------------------------------------------------------------------------
+          # Config (les valeurs sensibles viennent des "Secrets" GitHub, jamais du code)
+          # ---------------------------------------------------------------------------
+          ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+          BREVO_API_KEY     = os.environ["BREVO_API_KEY"]
+          BREVO_LIST_ID     = int(os.environ["BREVO_LIST_ID"])
+          SENDER_EMAIL      = os.environ["SENDER_EMAIL"]
+          SENDER_NAME       = os.environ.get("SENDER_NAME", "Veille Droit")
+
+          # Modèle Claude. sonnet = meilleure nuance juridique. Mets "claude-haiku-4-5"
+          # pour diviser le coût par ~5 si tu veux economiser.
+          CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+
+          # Sources : flux RSS officiels (gratuits, réutilisables, déjà semi-vulgarisés)
+          RSS_FEEDS = [
+              "https://www.service-public.fr/abonnements/rss/actu-actualites-particuliers.rss",
+              "https://www.service-public.fr/abonnements/rss/actu-actu-pro.rss",
+          ]
+
+          SEEN_FILE = "seen.json"        # mémoire des news déjà envoyées (anti-doublon)
+          MAX_ITEMS_TO_MODEL = 18        # borne ce qu'on envoie à Claude (coût + bruit)
+
+          DISCLAIMER = (
+              "Lettre automatisée et vulgarisée — sans valeur juridique. "
+              "Pour toute démarche, vérifiez sur service-public.fr ou legifrance.gouv.fr."
+          )
+
+          # ---------------------------------------------------------------------------
+          # Étape 1 — Récupérer les nouveautés
+          # ---------------------------------------------------------------------------
+          def load_seen():
+              try:
+                  with open(SEEN_FILE, "r", encoding="utf-8") as f:
+                      return set(json.load(f))
+              except (FileNotFoundError, json.JSONDecodeError):
+                  return set()
+
+
+          def save_seen(seen):
+              # On garde une fenêtre glissante pour ne pas faire grossir le fichier à l'infini
+              trimmed = list(seen)[-800:]
+              with open(SEEN_FILE, "w", encoding="utf-8") as f:
+                  json.dump(trimmed, f, ensure_ascii=False, indent=0)
+
+
+          def fetch_new_items(seen):
+              items = []
+              for url in RSS_FEEDS:
+                  try:
+                      feed = feedparser.parse(url)
+                  except Exception as e:
+                      print(f"[warn] flux KO {url}: {e}", file=sys.stderr)
+                      continue
+                  for entry in feed.entries:
+                      uid = entry.get("id") or entry.get("link") or entry.get("title", "")
+                      if not uid or uid in seen:
+                          continue
+                      items.append({
+                          "id": uid,
+                          "title": entry.get("title", "").strip(),
+                          "summary": entry.get("summary", "").strip(),
+                          "link": entry.get("link", "").strip(),
+                      })
+              # Les flux renvoient déjà du récent ; on borne pour le coût/qualité
+              return items[:MAX_ITEMS_TO_MODEL]
+
+
+          # ---------------------------------------------------------------------------
+          # Étape 2 — Sélection + vulgarisation par Claude
+          # ---------------------------------------------------------------------------
+          SYSTEM_PROMPT = """Tu es un journaliste juridique français qui vulgarise le droit \
+          pour le grand public. On te donne une liste de nouveautés brutes (actus de \
+          service-public.fr).
+
+          Ta mission :
+          - Garde UNIQUEMENT ce qui change concrètement les droits, démarches ou obligations \
+          des gens (nouvelle loi, décret, décision, barème, date qui change la vie réelle).
+          - Ignore le bruit : rappels génériques, contenu purement administratif, marronniers \
+          sans nouveauté.
+          - Garde au maximum 3 sujets, les plus importants. S'il n'y a rien de notable, \
+          réponds EXACTEMENT le mot: RIEN
+
+          Pour chaque sujet retenu, écris :
+          - un titre court et clair (sans emoji)
+          - 3 à 4 phrases fluides, simples, synthétiques : ce qui change, pour qui, à partir de quand.
+
+          Règles strictes :
+          - N'invente JAMAIS un fait, une date ou un chiffre absent de la source. Dans le doute, \
+          reste vague plutôt que faux.
+          - Ton neutre, factuel, professionnel. Aucun emoji.
+          - Réponds en HTML propre et RIEN d'autre (pas de ```), avec ce format pour chaque sujet :
+            <h2 style="font-size:18px;margin:24px 0 6px;">TITRE</h2>
+            <p style="margin:0 0 4px;line-height:1.55;">TEXTE</p>
+            <p style="margin:0 0 8px;font-size:13px;"><a href="LIEN">Source officielle</a></p>
+          """
+
+
+          def vulgarize(items):
+              client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+              payload = "\n\n".join(
+                  f"- TITRE: {it['title']}\n  RESUME: {it['summary']}\n  LIEN: {it['link']}"
+                  for it in items
+              )
+              msg = client.messages.create(
+                  model=CLAUDE_MODEL,
+                  max_tokens=1500,
+                  system=SYSTEM_PROMPT,
+                  messages=[{"role": "user", "content": f"Nouveautés du jour :\n\n{payload}"}],
+              )
+              text = "".join(b.text for b in msg.content if b.type == "text").strip()
+              text = text.replace("```html", "").replace("```", "").strip()
+              return text
+
+
+          # ---------------------------------------------------------------------------
+          # Étape 3 — Envoi via Brevo (campagne -> gère désinscription auto / RGPD)
+          # ---------------------------------------------------------------------------
+          def build_html(body_html):
+              today = dt.date.today().strftime("%d/%m/%Y")
+              return f"""<!doctype html>
+          <html lang="fr"><body style="margin:0;background:#faf7f2;
+            font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a;">
+            <div style="max-width:600px;margin:0 auto;padding:28px 22px;">
+              <p style="font-size:13px;letter-spacing:1px;text-transform:uppercase;
+                 color:#9a5b3b;margin:0 0 2px;">Le droit, en clair</p>
+              <p style="font-size:14px;color:#666;margin:0 0 18px;">{today}</p>
+              {body_html}
+              <hr style="border:none;border-top:1px solid #e6ddd0;margin:28px 0 12px;">
+              <p style="font-size:12px;color:#999;line-height:1.5;">{DISCLAIMER}</p>
+              <p style="font-size:12px;color:#999;">
+                <a href="{{{{ unsubscribe }}}}" style="color:#999;">Se désinscrire</a>
+              </p>
+            </div>
+          </body></html>"""
+
+
+          def send_campaign(html):
+              headers = {"api-key": BREVO_API_KEY, "content-type": "application/json"}
+              today = dt.date.today().strftime("%d/%m/%Y")
+              create = requests.post(
+                  "https://api.brevo.com/v3/emailCampaigns",
+                  headers=headers,
+                  json={
+                      "name": f"Veille droit {today}",
+                      "subject": f"Le droit en clair — {today}",
+                      "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
+                      "type": "classic",
+                      "htmlContent": html,
+                      "recipients": {"listIds": [BREVO_LIST_ID]},
+                  },
+                  timeout=30,
+              )
+              create.raise_for_status()
+              campaign_id = create.json()["id"]
+              send = requests.post(
+                  f"https://api.brevo.com/v3/emailCampaigns/{campaign_id}/sendNow",
+                  headers=headers, timeout=30,
+              )
+              send.raise_for_status()
+              print(f"[ok] campagne {campaign_id} envoyée à la liste {BREVO_LIST_ID}")
+
+
+          # ---------------------------------------------------------------------------
+          # Orchestration
+          # ---------------------------------------------------------------------------
+          def main():
+              seen = load_seen()
+              items = fetch_new_items(seen)
+              print(f"[info] {len(items)} nouvelle(s) entrée(s) à traiter")
+
+              if not items:
+                  print("[info] rien de neuf, pas d'envoi.")
+                  return
+
+              # On marque tout comme vu, qu'on envoie ou non (évite de re-traiter demain)
+              for it in items:
+                  seen.add(it["id"])
+
+              body = vulgarize(items)
+              if body.strip().upper().startswith("RIEN"):
+                  print("[info] Claude n'a rien jugé notable, pas d'envoi.")
+                  save_seen(seen)
+                  return
+
+              html = build_html(body)
+              send_campaign(html)
+              save_seen(seen)
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+      - name: Lancer la veille
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+          BREVO_LIST_ID: ${{ secrets.BREVO_LIST_ID }}
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          SENDER_NAME: ${{ secrets.SENDER_NAME }}
+        run: python newsletter.py
+      - name: Sauvegarder la memoire anti-doublon
+        run: |
+          git config user.name "veille-bot"
+          git config user.email "veille-bot@users.noreply.github.com"
+          git add seen.json || true
+          git commit -m "maj seen.json" || echo "rien a committer"
+          git push || echo "rien a pousser"
