@@ -25,9 +25,11 @@ jobs:
           #!/usr/bin/env python3
           # -*- coding: utf-8 -*-
           """
-          Veille droit français — pipeline 100% autonome.
+          Le Quotidien Juridique — pipeline 100% autonome.
           1. Récupère les nouveautés (flux RSS officiels service-public.fr)
-          2. Sélectionne + vulgarise les plus importantes via l'API Claude
+          2. Sélectionne + vulgarise via l'API Claude, qui fournit aussi :
+             - un OBJET d'email accrocheur (le sujet phare du jour)
+             - une ACCROCHE (texte d'aperçu gris dans la boîte mail)
           3. Envoie une campagne email via Brevo à toute la liste d'abonnés
 
           Aucune intervention humaine. Lancé chaque matin par GitHub Actions.
@@ -49,20 +51,22 @@ jobs:
           BREVO_API_KEY     = os.environ["BREVO_API_KEY"]
           BREVO_LIST_ID     = int(os.environ["BREVO_LIST_ID"])
           SENDER_EMAIL      = os.environ["SENDER_EMAIL"]
-          SENDER_NAME       = os.environ.get("SENDER_NAME", "Veille Droit")
+          SENDER_NAME       = os.environ.get("SENDER_NAME", "Le Quotidien Juridique")
 
-          # Modèle Claude. sonnet = meilleure nuance juridique. Mets "claude-haiku-4-5"
-          # pour diviser le coût par ~5 si tu veux economiser.
+          BRAND   = "Le Quotidien Juridique"
+          TAGLINE = "L'essentiel du droit français"
+
+          # Modèle Claude. sonnet = meilleure nuance juridique. "claude-haiku-4-5" pour
+          # diviser le coût par ~5.
           CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 
-          # Sources : flux RSS officiels (gratuits, réutilisables, déjà semi-vulgarisés)
           RSS_FEEDS = [
               "https://www.service-public.fr/abonnements/rss/actu-actualites-particuliers.rss",
               "https://www.service-public.fr/abonnements/rss/actu-actu-pro.rss",
           ]
 
-          SEEN_FILE = "seen.json"        # mémoire des news déjà envoyées (anti-doublon)
-          MAX_ITEMS_TO_MODEL = 18        # borne ce qu'on envoie à Claude (coût + bruit)
+          SEEN_FILE = "seen.json"
+          MAX_ITEMS_TO_MODEL = 18
 
           DISCLAIMER = (
               "Lettre automatisée et vulgarisée — sans valeur juridique. "
@@ -81,7 +85,6 @@ jobs:
 
 
           def save_seen(seen):
-              # On garde une fenêtre glissante pour ne pas faire grossir le fichier à l'infini
               trimmed = list(seen)[-800:]
               with open(SEEN_FILE, "w", encoding="utf-8") as f:
                   json.dump(trimmed, f, ensure_ascii=False, indent=0)
@@ -105,37 +108,41 @@ jobs:
                           "summary": entry.get("summary", "").strip(),
                           "link": entry.get("link", "").strip(),
                       })
-              # Les flux renvoient déjà du récent ; on borne pour le coût/qualité
               return items[:MAX_ITEMS_TO_MODEL]
 
 
           # ---------------------------------------------------------------------------
-          # Étape 2 — Sélection + vulgarisation par Claude
+          # Étape 2 — Sélection + vulgarisation par Claude (objet + accroche + corps)
           # ---------------------------------------------------------------------------
-          SYSTEM_PROMPT = """Tu es un journaliste juridique français qui vulgarise le droit \
-          pour le grand public. On te donne une liste de nouveautés brutes (actus de \
-          service-public.fr).
+          SYSTEM_PROMPT = """Tu es le rédacteur du Quotidien Juridique, une lettre quotidienne \
+          qui synthétise l'actualité du droit français pour un lectorat de professionnels \
+          (juristes, avocats) et de citoyens avertis. Ton registre : pro, précis, sans \
+          condescendance — tu fais GAGNER DU TEMPS, tu ne "simplifies" pas pour des débutants.
 
-          Ta mission :
-          - Garde UNIQUEMENT ce qui change concrètement les droits, démarches ou obligations \
-          des gens (nouvelle loi, décret, décision, barème, date qui change la vie réelle).
-          - Ignore le bruit : rappels génériques, contenu purement administratif, marronniers \
-          sans nouveauté.
-          - Garde au maximum 3 sujets, les plus importants. S'il n'y a rien de notable, \
-          réponds EXACTEMENT le mot: RIEN
+          On te donne une liste de nouveautés brutes (actus de service-public.fr).
 
-          Pour chaque sujet retenu, écris :
-          - un titre court et clair (sans emoji)
-          - 3 à 4 phrases fluides, simples, synthétiques : ce qui change, pour qui, à partir de quand.
+          Sélection :
+          - Garde UNIQUEMENT ce qui change concrètement le droit, les droits, démarches ou \
+          obligations (nouvelle loi, décret, décision, barème, échéance réelle).
+          - Ignore le bruit : rappels génériques, contenu purement administratif, marronniers.
+          - 3 sujets maximum, classés du plus important au moins important.
+          - Si rien de notable : réponds EXACTEMENT le mot RIEN (et rien d'autre).
 
-          Règles strictes :
-          - N'invente JAMAIS un fait, une date ou un chiffre absent de la source. Dans le doute, \
-          reste vague plutôt que faux.
-          - Ton neutre, factuel, professionnel. Aucun emoji.
-          - Réponds en HTML propre et RIEN d'autre (pas de ```), avec ce format pour chaque sujet :
-            <h2 style="font-size:18px;margin:24px 0 6px;">TITRE</h2>
-            <p style="margin:0 0 4px;line-height:1.55;">TEXTE</p>
-            <p style="margin:0 0 8px;font-size:13px;"><a href="LIEN">Source officielle</a></p>
+          Sinon, réponds EXACTEMENT dans ce format (respecte les balises, n'ajoute pas de ```):
+
+          OBJET: <une ligne, max 60 caractères, qui donne envie d'ouvrir : le sujet phare \
+          formulé comme un titre de presse, sans nom de marque, sans date>
+          ACCROCHE: <une ligne, max 90 caractères, qui résume l'enjeu du jour et complète \
+          l'objet sans le répéter>
+          ---
+          <corps HTML, un bloc par sujet, dans ce format exact :>
+          <h2 style="font-size:18px;margin:24px 0 6px;color:#1a1a1a;">TITRE</h2>
+          <p style="margin:0 0 4px;line-height:1.55;">3 à 4 phrases fluides : ce qui change, \
+          pour qui, à partir de quand.</p>
+          <p style="margin:0 0 8px;font-size:13px;"><a href="LIEN" style="color:#9a5b3b;">Source officielle</a></p>
+
+          Règles strictes : n'invente JAMAIS un fait, une date ou un chiffre absent de la \
+          source ; dans le doute, reste vague plutôt que faux. Aucun emoji. Ton neutre et factuel.
           """
 
 
@@ -147,28 +154,55 @@ jobs:
               )
               msg = client.messages.create(
                   model=CLAUDE_MODEL,
-                  max_tokens=1500,
+                  max_tokens=1600,
                   system=SYSTEM_PROMPT,
                   messages=[{"role": "user", "content": f"Nouveautés du jour :\n\n{payload}"}],
               )
               text = "".join(b.text for b in msg.content if b.type == "text").strip()
               text = text.replace("```html", "").replace("```", "").strip()
-              return text
 
+              if text.upper().startswith("RIEN"):
+                  return None
 
-          # ---------------------------------------------------------------------------
-          # Étape 3 — Envoi via Brevo (campagne -> gère désinscription auto / RGPD)
-          # ---------------------------------------------------------------------------
-          def build_html(body_html):
+              # Parsing robuste OBJET / ACCROCHE / corps
+              objet, accroche, body = None, None, text
+              if "---" in text:
+                  head, body = text.split("---", 1)
+                  for line in head.splitlines():
+                      low = line.strip().lower()
+                      if low.startswith("objet:"):
+                          objet = line.split(":", 1)[1].strip()
+                      elif low.startswith("accroche:"):
+                          accroche = line.split(":", 1)[1].strip()
+              body = body.strip()
+
               today = dt.date.today().strftime("%d/%m/%Y")
+              if not objet:
+                  objet = f"{BRAND} — {today}"
+              if not accroche:
+                  accroche = TAGLINE
+              return {"objet": objet, "accroche": accroche, "body": body}
+
+
+          # ---------------------------------------------------------------------------
+          # Étape 3 — Mise en forme + envoi via Brevo
+          # ---------------------------------------------------------------------------
+          def build_html(content):
+              today = dt.date.today().strftime("%d/%m/%Y")
+              # Préheader : texte d'aperçu dans la boîte mail, masqué dans le corps
+              preheader = (
+                  f'<div style="display:none;max-height:0;overflow:hidden;opacity:0;">'
+                  f'{content["accroche"]}</div>'
+              )
               return f"""<!doctype html>
           <html lang="fr"><body style="margin:0;background:#faf7f2;
             font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a;">
+            {preheader}
             <div style="max-width:600px;margin:0 auto;padding:28px 22px;">
               <p style="font-size:13px;letter-spacing:1px;text-transform:uppercase;
-                 color:#9a5b3b;margin:0 0 2px;">Le Quotidien Juridique</p>
+                 color:#9a5b3b;margin:0 0 2px;">{TAGLINE}</p>
               <p style="font-size:14px;color:#666;margin:0 0 18px;">{today}</p>
-              {body_html}
+              {content["body"]}
               <hr style="border:none;border-top:1px solid #e6ddd0;margin:28px 0 12px;">
               <p style="font-size:12px;color:#999;line-height:1.5;">{DISCLAIMER}</p>
               <p style="font-size:12px;color:#999;">
@@ -178,15 +212,16 @@ jobs:
           </body></html>"""
 
 
-          def send_campaign(html):
+          def send_campaign(content):
               headers = {"api-key": BREVO_API_KEY, "content-type": "application/json"}
               today = dt.date.today().strftime("%d/%m/%Y")
+              html = build_html(content)
               create = requests.post(
                   "https://api.brevo.com/v3/emailCampaigns",
                   headers=headers,
                   json={
-                      "name": f"Veille droit {today}",
-                      "subject": f"Le Quotidien Juridique — {today}",
+                      "name": f"{BRAND} {today}",
+                      "subject": content["objet"],
                       "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
                       "type": "classic",
                       "htmlContent": html,
@@ -201,7 +236,7 @@ jobs:
                   headers=headers, timeout=30,
               )
               send.raise_for_status()
-              print(f"[ok] campagne {campaign_id} envoyée à la liste {BREVO_LIST_ID}")
+              print(f"[ok] campagne {campaign_id} envoyée — objet: {content['objet']}")
 
 
           # ---------------------------------------------------------------------------
@@ -216,18 +251,16 @@ jobs:
                   print("[info] rien de neuf, pas d'envoi.")
                   return
 
-              # On marque tout comme vu, qu'on envoie ou non (évite de re-traiter demain)
               for it in items:
                   seen.add(it["id"])
 
-              body = vulgarize(items)
-              if body.strip().upper().startswith("RIEN"):
+              content = vulgarize(items)
+              if content is None:
                   print("[info] Claude n'a rien jugé notable, pas d'envoi.")
                   save_seen(seen)
                   return
 
-              html = build_html(body)
-              send_campaign(html)
+              send_campaign(content)
               save_seen(seen)
 
 
