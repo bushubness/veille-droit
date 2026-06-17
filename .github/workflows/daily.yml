@@ -166,7 +166,7 @@ jobs:
             font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1a1a1a;">
             <div style="max-width:600px;margin:0 auto;padding:28px 22px;">
               <p style="font-size:13px;letter-spacing:1px;text-transform:uppercase;
-                 color:#9a5b3b;margin:0 0 2px;">Le droit, en clair</p>
+                 color:#9a5b3b;margin:0 0 2px;">Le Quotidien Juridique</p>
               <p style="font-size:14px;color:#666;margin:0 0 18px;">{today}</p>
               {body_html}
               <hr style="border:none;border-top:1px solid #e6ddd0;margin:28px 0 12px;">
@@ -186,7 +186,7 @@ jobs:
                   headers=headers,
                   json={
                       "name": f"Veille droit {today}",
-                      "subject": f"Le droit en clair — {today}",
+                      "subject": f"Le Quotidien Juridique — {today}",
                       "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
                       "type": "classic",
                       "htmlContent": html,
